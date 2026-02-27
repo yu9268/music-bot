@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Yay DJ Bot",
+  "version": "1.0.1",
+  "description": "Watch Yay conference chat and play YouTube on !play",
+  "permissions": ["tabs", "scripting", "storage"],
+  "host_permissions": ["https://yay.space/*", "https://www.youtube.com/*", "http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://yay.space/*"],
+      "js": ["content_yay.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
