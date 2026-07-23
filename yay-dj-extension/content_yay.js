@@ -33,15 +33,6 @@
     log("conference detected:", location.pathname);
   }
 
-  async function waitWrapper() {
-    while (true) {
-      const w = document.querySelector(".Messages__wrapper");
-      if (w) return w;
-      log("Messages__wrapper not found yet (open chat panel?)");
-      await sleep(500);
-    }
-  }
-
   // DOMノード単位の重複排除（同文連投も許可するため、テキストではなくNodeで判定）
   const seen = new WeakSet();
 
@@ -161,31 +152,64 @@
   // --- SPA対策の本体 ---
   await waitUntilConference();
 
-  const wrapper = await waitWrapper();
-  log("wrapper found, attaching observer");
+  let wrapper = null;
+  let observer = null;
+  let waitingLogged = false;
 
-  const obs = new MutationObserver((muts) => {
-    for (const m of muts) {
-      for (const node of m.addedNodes) {
-        if (!(node instanceof HTMLElement)) continue;
+  function attachObserver(nextWrapper) {
+    observer?.disconnect();
+    wrapper = nextWrapper;
 
-        // 追加ノードがMessages__item自身の場合
-        if (node.classList?.contains("Messages__item")) emit(node);
+    // 再接続時に過去のコマンドを実行しないよう、既存メッセージは処理済みにする
+    wrapper.querySelectorAll(".Messages__item").forEach((item) => seen.add(item));
 
-        // 追加ノード配下にMessages__itemがある場合
-        node.querySelectorAll?.(".Messages__item")?.forEach(emit);
+    observer = new MutationObserver((muts) => {
+      for (const m of muts) {
+        for (const node of m.addedNodes) {
+          if (!(node instanceof HTMLElement)) continue;
+
+          // 追加ノードがMessages__item自身の場合
+          if (node.classList?.contains("Messages__item")) emit(node);
+
+          // 追加ノード配下にMessages__itemがある場合
+          node.querySelectorAll?.(".Messages__item")?.forEach(emit);
+        }
       }
-    }
-  });
+    });
 
-  obs.observe(wrapper, { childList: true, subtree: true });
+    observer.observe(wrapper, { childList: true, subtree: true });
+    waitingLogged = false;
+    log("wrapper found, attaching observer");
+  }
 
-  // 保険：末尾ポーリング（Observerが取りこぼすケース対策）
+  // チャットを閉じるとwrapper自体が削除されるため、開き直した要素へ再接続する
   while (true) {
-    if (await isEnabled()) {
+    if (!isConference()) {
+      observer?.disconnect();
+      observer = null;
+      wrapper = null;
+      await waitUntilConference();
+    }
+
+    const currentWrapper = document.querySelector(".Messages__wrapper");
+    if (currentWrapper && currentWrapper !== wrapper) {
+      attachObserver(currentWrapper);
+    } else if (!currentWrapper && wrapper) {
+      observer?.disconnect();
+      observer = null;
+      wrapper = null;
+      log("chat pane closed; waiting for reopen");
+    } else if (!currentWrapper && !waitingLogged) {
+      log("Messages__wrapper not found yet (open chat pane?)");
+      waitingLogged = true;
+    }
+
+    // Observer取りこぼし対策。現在接続中のwrapperだけを見る。
+    if (wrapper?.isConnected && (await isEnabled())) {
       const items = wrapper.querySelectorAll(".Messages__item");
       if (items.length) emit(items[items.length - 1]);
     }
+
     await sleep(300);
   }
 })();
