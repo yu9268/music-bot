@@ -51,6 +51,83 @@
     return t || null;
   }
 
+  function isVisible(element) {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.display !== "none"
+    );
+  }
+
+  function findChatInput() {
+    const selectors = [
+      ".Messages__input textarea",
+      ".Messages__input input",
+      "textarea",
+      'input[type="text"]',
+      '[contenteditable="true"]',
+    ];
+    const candidates = [...document.querySelectorAll(selectors.join(","))]
+      .filter(isVisible)
+      .sort(
+        (a, b) =>
+          b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom
+      );
+    return candidates[0] || null;
+  }
+
+  function setNativeValue(element, value) {
+    const prototype =
+      element instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (setter) setter.call(element, value);
+    else element.value = value;
+  }
+
+  async function postChatMessage(text) {
+    const input = findChatInput();
+    if (!input) {
+      log("chat input not found; reply=", text);
+      return false;
+    }
+
+    input.focus();
+    if (input.isContentEditable) {
+      input.textContent = text;
+    } else {
+      setNativeValue(input, text);
+    }
+    input.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: text,
+      })
+    );
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await sleep(50);
+
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      input.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+    }
+    log("chat reply submitted:", text);
+    return true;
+  }
+
   // 任意: 自分のメッセージだけ反応したい時に実装
   // function isMine(item) {
   //   return item.classList.contains("Messages__item--mine"); // ←仮。実DOMに合わせて調整
@@ -74,7 +151,10 @@
     chrome.runtime.sendMessage({ type: "chat", text: t }, (resp) => {
       const err = chrome.runtime.lastError;
       if (err) log("sendMessage error:", err.message);
-      else log("sendMessage ok:", resp);
+      else {
+        log("sendMessage ok:", resp);
+        if (resp?.ok && resp?.reply) postChatMessage(resp.reply);
+      }
     });
   }
 
