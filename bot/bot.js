@@ -12,6 +12,7 @@
 //  - !random <keyword>  : search, shuffle, and continuously play tracks
 //  - !playlist <url>    : continuously play a YouTube playlist
 //  - !now               : show the current track
+//  - !volume <0-100>    : set VLC volume
 //
 // Requirements:
 //  - Node.js 18+ (fetch available)
@@ -97,6 +98,18 @@ http.createServer(async (req, res) => {
     if (u.pathname === "/now") {
       const now = await getNowPlaying();
       return sendJson(res, 200, { ok: true, ...now });
+    }
+
+    if (u.pathname === "/volume") {
+      const value = Number(u.searchParams.get("value"));
+      if (!Number.isInteger(value) || value < 0 || value > 100) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: "volume must be an integer from 0 to 100",
+        });
+      }
+      await setVolume(value);
+      return sendJson(res, 200, { ok: true, volume: value });
     }
 
     return sendJson(res, 404, { ok: false });
@@ -323,6 +336,13 @@ async function resumePlayback() {
   console.log("▶ resumed");
 }
 
+async function setVolume(value) {
+  await vlcRequest(
+    `/requests/status.xml?command=volume&val=${encodeURIComponent(`${value}%`)}`
+  );
+  console.log(`🔊 volume ${value}%`);
+}
+
 // Smart play:
 //  - stopped/paused/unknown -> play now
 //  - playing               -> queue next
@@ -395,6 +415,7 @@ function printHelp() {
   console.log("  !random <keyword>    : shuffle 15 YouTube search results");
   console.log("  !playlist <url>      : play up to 50 playlist tracks");
   console.log("  !now                 : show current track");
+  console.log("  !volume <0-100>      : set VLC volume");
 }
 
 const rl = readline.createInterface({
@@ -444,6 +465,17 @@ rl.on("line", async (line) => {
       const now = await getNowPlaying();
       console.log(now.title ? `Now playing: ${now.title}` : `Nothing playing (${now.state})`);
     });
+    return;
+  }
+
+  if (s.startsWith("!volume ")) {
+    const value = Number(s.slice("!volume ".length).trim());
+    if (!Number.isInteger(value) || value < 0 || value > 100) {
+      console.log("usage: !volume <0-100>");
+      rl.prompt();
+      return;
+    }
+    await run(() => setVolume(value));
     return;
   }
 
