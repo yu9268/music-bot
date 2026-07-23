@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Yay DJ Bot",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Control a local YouTube DJ bot from Yay conference chat",
   "permissions": ["tabs", "scripting", "storage"],
   "host_permissions": ["https://yay.space/*", "https://www.youtube.com/*", "http://127.0.0.1/*"],
