@@ -4,7 +4,7 @@ const statusEl = document.getElementById("status");
 function setUI(enabled) {
   toggleBtn.textContent = enabled ? "ON（監視中）→ OFFにする" : "OFF → ONにする";
   statusEl.textContent = enabled
-    ? "Yay通話チャットを監視中。\n!p,曲名\n!random,検索語\n!playlist,URL\n!now"
+    ? "Yay通話チャットを監視中。\n!p,曲名\n!random,検索語\n!playlist,URL\n!now\n!vol,0〜100"
     : "停止中。ONにすると監視を開始。";
 }
 
