@@ -13,6 +13,12 @@ function parseCommand(text) {
   m = t.match(/^!playlist,(https?:\/\/\S+)$/i);
   if (m) return { cmd: "playlist", url: m[1].trim() };
 
+  m = t.match(/^!vol,(\d{1,3})$/i);
+  if (m) {
+    const value = Number(m[1]);
+    if (value >= 0 && value <= 100) return { cmd: "volume", value };
+  }
+
   // 制御系（空白なし推奨）
   if (/^!stop\b/i.test(t)) return { cmd: "stop" };
   if (/^!skip\b/i.test(t)) return { cmd: "skip" };
@@ -43,6 +49,9 @@ async function callBot(cmd) {
     return fetch(`${BOT}/playlist?url=${encodeURIComponent(cmd.url)}`);
   }
   if (cmd.cmd === "now") return fetch(`${BOT}/now`);
+  if (cmd.cmd === "volume") {
+    return fetch(`${BOT}/volume?value=${encodeURIComponent(cmd.value)}`);
+  }
 
   throw new Error("unknown cmd");
 }
