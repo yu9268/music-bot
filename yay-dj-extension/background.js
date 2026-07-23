@@ -7,6 +7,12 @@ function parseCommand(text) {
   let m = t.match(/^!p,(.+)$/i);
   if (m) return { cmd: "play", q: m[1].trim() };
 
+  m = t.match(/^!random,(.+)$/i);
+  if (m) return { cmd: "random", q: m[1].trim() };
+
+  m = t.match(/^!playlist,(https?:\/\/\S+)$/i);
+  if (m) return { cmd: "playlist", url: m[1].trim() };
+
   // 制御系（空白なし推奨）
   if (/^!stop\b/i.test(t)) return { cmd: "stop" };
   if (/^!skip\b/i.test(t)) return { cmd: "skip" };
@@ -14,6 +20,7 @@ function parseCommand(text) {
   if (/^!pause\b/i.test(t)) return { cmd: "pause" };
   if (/^!resume\b/i.test(t)) return { cmd: "resume" };
   if (/^!state\b/i.test(t)) return { cmd: "state" };
+  if (/^!now\b/i.test(t)) return { cmd: "now" };
 
   return null;
 }
@@ -29,6 +36,13 @@ async function callBot(cmd) {
   if (cmd.cmd === "pause") return fetch(`${BOT}/pause`);
   if (cmd.cmd === "resume") return fetch(`${BOT}/resume`);
   if (cmd.cmd === "state") return fetch(`${BOT}/state`);
+  if (cmd.cmd === "random") {
+    return fetch(`${BOT}/random?q=${encodeURIComponent(cmd.q)}`);
+  }
+  if (cmd.cmd === "playlist") {
+    return fetch(`${BOT}/playlist?url=${encodeURIComponent(cmd.url)}`);
+  }
+  if (cmd.cmd === "now") return fetch(`${BOT}/now`);
 
   throw new Error("unknown cmd");
 }
@@ -44,11 +58,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     const res = await callBot(cmd);
     const text = await res.text().catch(() => "");
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {}
+
+    let reply = null;
+    if (cmd.cmd === "now" && res.ok) {
+      reply = data?.title
+        ? `♪ 再生中：${data.title}`
+        : "現在再生中の曲はありません";
+    }
 
     return sendResponse({
       ok: res.ok,
       action: cmd.cmd,
       q: cmd.q,
+      reply,
       status: res.status,
       body: text.slice(0, 200),
     });
