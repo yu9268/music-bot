@@ -3,9 +3,13 @@ const BOT = "http://127.0.0.1:39200";
 function parseCommand(text) {
   const t = (text || "").trim();
 
+  // 1曲ループ: !p,loop,keyword-or-url
+  let m = t.match(/^!p,loop,(.+)$/i);
+  if (m) return { cmd: "play", q: m[1].trim(), loop: true };
+
   // 再生: !p,keyword-or-url
-  let m = t.match(/^!p,(.+)$/i);
-  if (m) return { cmd: "play", q: m[1].trim() };
+  m = t.match(/^!p,(.+)$/i);
+  if (m) return { cmd: "play", q: m[1].trim(), loop: false };
 
   m = t.match(/^!random,(.+)$/i);
   if (m) return { cmd: "random", q: m[1].trim() };
@@ -34,7 +38,9 @@ function parseCommand(text) {
 async function callBot(cmd) {
   // GETで統一（実装が楽）
   if (cmd.cmd === "play") {
-    return fetch(`${BOT}/play?q=${encodeURIComponent(cmd.q)}`);
+    return fetch(
+      `${BOT}/play?q=${encodeURIComponent(cmd.q)}&loop=${cmd.loop ? "1" : "0"}`
+    );
   }
   if (cmd.cmd === "stop") return fetch(`${BOT}/stop`);
   if (cmd.cmd === "skip") return fetch(`${BOT}/skip`);
