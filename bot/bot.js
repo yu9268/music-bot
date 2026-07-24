@@ -1,6 +1,7 @@
 // bot.js
 // Console jukebox:
 //  - !play <keyword|url> : stopped/paused -> play now, playing -> queue next
+//  - !playloop <keyword|url> : clear queue and repeat one track
 //  - !stop              : stop playback
 //  - !clear             : stop + clear playlist
 //  - !skip              : next track
@@ -39,8 +40,9 @@ http.createServer(async (req, res) => {
     if (u.pathname === "/play") {
       const q = (u.searchParams.get("q") || "").trim();
       if (!q) return sendJson(res, 400, { ok: false });
-      await playSmart(q);
-      return sendJson(res, 200, { ok: true });
+      const loop = u.searchParams.get("loop") === "1";
+      await playSmart(q, loop);
+      return sendJson(res, 200, { ok: true, loop });
     }
 
     if (u.pathname === "/stop") {
@@ -336,6 +338,15 @@ async function resumePlayback() {
   console.log("▶ resumed");
 }
 
+async function setRepeatEnabled(enabled) {
+  const raw = await vlcRequest("/requests/status.json");
+  const status = JSON.parse(raw);
+  const current = status.repeat === true;
+  if (current !== enabled) {
+    await vlcRequest("/requests/status.xml?command=pl_repeat");
+  }
+}
+
 async function setVolume(value) {
   await vlcRequest(
     `/requests/status.xml?command=volume&val=${encodeURIComponent(`${value}%`)}`
@@ -346,13 +357,20 @@ async function setVolume(value) {
 // Smart play:
 //  - stopped/paused/unknown -> play now
 //  - playing               -> queue next
-async function playSmart(query) {
+async function playSmart(query, loop = false) {
   console.log(`Searching: ${query}`);
   const audioUrl = await ytDlpGetAudioUrl(query);
 
   const state = await getVlcState();
 
-  if (state === "stopped" || state === "paused" || state === "unknown") {
+  if (loop) {
+    await vlcRequest("/requests/status.xml?command=pl_stop");
+    await vlcRequest("/requests/status.xml?command=pl_empty");
+  } else {
+    await setRepeatEnabled(false);
+  }
+
+  if (!loop && (state === "stopped" || state === "paused" || state === "unknown")) {
     await vlcRequest(`/requests/status.xml?command=pl_empty`);
   }
 
@@ -361,8 +379,9 @@ async function playSmart(query) {
 
   // ★ タイトル上書き
   await vlcRequest(`/requests/status.xml?command=in_setinfo&name=title&value=${encodeURIComponent(query)}`);
+  await setRepeatEnabled(loop);
 
-  console.log("▶ done");
+  console.log(loop ? "🔁 repeat one" : "▶ done");
 }
 
 async function playCollection(target, shouldShuffle) {
@@ -403,6 +422,7 @@ async function playCollection(target, shouldShuffle) {
 function printHelp() {
   console.log("Commands:");
   console.log("  !play <keyword|url>  : stopped/paused -> play now, playing -> queue next");
+  console.log("  !playloop <keyword|url> : clear queue and repeat one track");
   console.log("  !stop                : stop playback");
   console.log("  !clear               : stop + clear playlist");
   console.log("  !skip                : next track");
@@ -512,6 +532,17 @@ rl.on("line", async (line) => {
       return;
     }
     await run(() => playSmart(q));
+    return;
+  }
+
+  if (s.startsWith("!playloop ")) {
+    const q = s.slice("!playloop ".length).trim();
+    if (!q) {
+      console.log("usage: !playloop <keyword or url>");
+      rl.prompt();
+      return;
+    }
+    await run(() => playSmart(q, true));
     return;
   }
 
