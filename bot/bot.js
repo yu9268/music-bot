@@ -348,8 +348,10 @@ async function setRepeatEnabled(enabled) {
 }
 
 async function setVolume(value) {
+  // VLC HTTP API uses 256 as 100% volume.
+  const vlcValue = Math.round((value / 100) * 256);
   await vlcRequest(
-    `/requests/status.xml?command=volume&val=${encodeURIComponent(`${value}%`)}`
+    `/requests/status.xml?command=volume&val=${vlcValue}`
   );
   console.log(`🔊 volume ${value}%`);
 }
