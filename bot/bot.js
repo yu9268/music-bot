@@ -1,6 +1,7 @@
 // bot.js
 // Console jukebox:
 //  - !play <keyword|url> : stopped/paused -> play now, playing -> queue next
+//  - !playloop <keyword|url> : clear queue and repeat one track
 //  - !stop              : stop playback
 //  - !clear             : stop + clear playlist
 //  - !skip              : next track
@@ -9,6 +10,10 @@
 //  - !help              : show commands
 //  - !quit              : exit
 //  - !queue             : show current queue
+//  - !random <keyword>  : search, shuffle, and continuously play tracks
+//  - !playlist <url>    : continuously play a YouTube playlist
+//  - !now               : show the current track
+//  - !volume <0-100>    : set VLC volume
 //
 // Requirements:
 //  - Node.js 18+ (fetch available)
@@ -35,8 +40,9 @@ http.createServer(async (req, res) => {
     if (u.pathname === "/play") {
       const q = (u.searchParams.get("q") || "").trim();
       if (!q) return sendJson(res, 400, { ok: false });
-      await playSmart(q);
-      return sendJson(res, 200, { ok: true });
+      const loop = u.searchParams.get("loop") === "1";
+      await playSmart(q, loop);
+      return sendJson(res, 200, { ok: true, loop });
     }
 
     if (u.pathname === "/stop") {
@@ -75,6 +81,63 @@ http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, queue });
     }
 
+    if (u.pathname === "/random") {
+      const q = (u.searchParams.get("q") || "").trim();
+      if (!q) return sendJson(res, 400, { ok: false, error: "query is required" });
+      const count = await playCollection(`ytsearch15:${q}`, true);
+      return sendJson(res, 200, { ok: true, count });
+    }
+
+    if (u.pathname === "/playlist") {
+      const url = (u.searchParams.get("url") || "").trim();
+      if (!isUrl(url)) {
+        return sendJson(res, 400, { ok: false, error: "playlist URL is required" });
+      }
+      const count = await playCollection(url, false);
+      return sendJson(res, 200, { ok: true, count });
+    }
+
+    if (u.pathname === "/now") {
+      const now = await getNowPlaying();
+      return sendJson(res, 200, { ok: true, ...now });
+    }
+
+    if (u.pathname === "/pomo/start") {
+      const work = Number(u.searchParams.get("work"));
+      const rest = Number(u.searchParams.get("break"));
+      if (
+        !Number.isInteger(work) || !Number.isInteger(rest) ||
+        work < 1 || rest < 1 || work > 1440 || rest > 1440
+      ) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: "work and break must be integers from 1 to 1440",
+        });
+      }
+      return sendJson(res, 200, { ok: true, ...startPomodoro(work, rest) });
+    }
+
+    if (u.pathname === "/pomo/stop") {
+      stopPomodoro();
+      return sendJson(res, 200, { ok: true, active: false });
+    }
+
+    if (u.pathname === "/pomo/status") {
+      return sendJson(res, 200, { ok: true, ...getPomodoroStatus() });
+    }
+
+    if (u.pathname === "/volume") {
+      const value = Number(u.searchParams.get("value"));
+      if (!Number.isInteger(value) || value < 0 || value > 100) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: "volume must be an integer from 0 to 100",
+        });
+      }
+      await setVolume(value);
+      return sendJson(res, 200, { ok: true, volume: value });
+    }
+
     return sendJson(res, 404, { ok: false });
 
   } catch (e) {
@@ -85,11 +148,88 @@ http.createServer(async (req, res) => {
 });
 
 const readline = require("readline");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
+const path = require("path");
 
 const VLC_HOST = "127.0.0.1";
 const VLC_PORT = 8080;
 const VLC_PASSWORD = "vlcpass"; // ←自分のに変える（Lua HTTP password）
+
+const POMO_SOUNDS = {
+  work: path.join(__dirname, "sounds", "work-end.mp3"),
+  break: path.join(__dirname, "sounds", "break-end.mp3"),
+};
+
+let pomo = null;
+let alarmProcess = null;
+
+function playPomoAlarm(soundPath) {
+  if (alarmProcess && !alarmProcess.killed) alarmProcess.kill();
+  alarmProcess = spawn("ffplay", [
+    "-nodisp",
+    "-autoexit",
+    "-loglevel", "quiet",
+    soundPath,
+  ], { windowsHide: true, stdio: "ignore" });
+  alarmProcess.on("error", (error) => {
+    console.error(`Pomodoro alarm error: ${error.message}`);
+  });
+  alarmProcess.on("exit", () => {
+    alarmProcess = null;
+  });
+}
+
+function schedulePomoPhase() {
+  if (!pomo) return;
+  const delay = Math.max(0, pomo.deadline - Date.now());
+  pomo.timer = setTimeout(() => {
+    if (!pomo) return;
+    const finishedPhase = pomo.phase;
+    playPomoAlarm(finishedPhase === "work" ? POMO_SOUNDS.work : POMO_SOUNDS.break);
+    pomo.phase = finishedPhase === "work" ? "break" : "work";
+    const minutes = pomo.phase === "work" ? pomo.workMinutes : pomo.breakMinutes;
+    pomo.deadline = Date.now() + minutes * 60 * 1000;
+    console.log(
+      pomo.phase === "work"
+        ? `🍅 Work started (${minutes} min)`
+        : `☕ Break started (${minutes} min)`
+    );
+    schedulePomoPhase();
+  }, delay);
+}
+
+function startPomodoro(workMinutes, breakMinutes) {
+  stopPomodoro(false);
+  pomo = {
+    workMinutes,
+    breakMinutes,
+    phase: "work",
+    deadline: Date.now() + workMinutes * 60 * 1000,
+    timer: null,
+  };
+  schedulePomoPhase();
+  console.log(`🍅 Pomodoro started: ${workMinutes} min work / ${breakMinutes} min break`);
+  return getPomodoroStatus();
+}
+
+function stopPomodoro(log = true) {
+  if (pomo?.timer) clearTimeout(pomo.timer);
+  pomo = null;
+  if (alarmProcess && !alarmProcess.killed) alarmProcess.kill();
+  alarmProcess = null;
+  if (log) console.log("⏹ Pomodoro stopped");
+}
+
+function getPomodoroStatus() {
+  if (!pomo) return { active: false };
+  return {
+    active: true,
+    phase: pomo.phase,
+    remainingSeconds: Math.max(0, Math.ceil((pomo.deadline - Date.now()) / 1000)),
+    workMinutes: pomo.workMinutes,
+    breakMinutes: pomo.breakMinutes,
+  };
+}
 
 function basicAuthHeader(password) {
   const token = Buffer.from(`:${password}`, "utf8").toString("base64"); // username空欄
@@ -162,17 +302,103 @@ function ytDlpGetAudioUrl(queryOrUrl) {
   });
 }
 
+function execYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "yt-dlp",
+      args,
+      { windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(`yt-dlp failed: ${stderr || err.message}`));
+          return;
+        }
+        resolve(stdout);
+      }
+    );
+  });
+}
+
+async function ytDlpGetEntries(target) {
+  const stdout = await execYtDlp([
+    "--flat-playlist",
+    "--dump-single-json",
+    "--playlist-end",
+    "50",
+    target,
+  ]);
+  const data = JSON.parse(stdout);
+  const entries = Array.isArray(data.entries) ? data.entries : [data];
+
+  return entries
+    .map((entry) => {
+      const id = String(entry.id || "").trim();
+      let url = String(entry.webpage_url || entry.url || "").trim();
+      if (!isUrl(url) && id) {
+        url = `https://www.youtube.com/watch?v=${encodeURIComponent(id)}`;
+      }
+      return {
+        title: String(entry.title || id || "Unknown track").trim(),
+        url,
+      };
+    })
+    .filter((entry) => isUrl(entry.url));
+}
+
+function shuffle(items) {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 async function getVlcState() {
   const xml = await vlcRequest(`/requests/status.xml`);
   const m = xml.match(/<state>([^<]+)<\/state>/);
   return m ? m[1].trim() : "unknown";
 }
 
+async function getNowPlaying() {
+  const raw = await vlcRequest("/requests/status.json");
+  const status = JSON.parse(raw);
+  const meta = status?.information?.category?.meta || {};
+  const queue = await getQueue();
+  const current = queue.find((item) => item.current);
+  const title = String(meta.title || meta.filename || current?.name || "").trim();
+
+  return {
+    state: String(status.state || "unknown"),
+    title: title || null,
+  };
+}
+
 // --- VLC controls ---
 
-async function enqueueUrl(url) {
+async function enqueueUrl(url, title = "") {
+  const titleOption = title
+    ? `&option=${encodeURIComponent(`:meta-title=${title}`)}`
+    : "";
   await vlcRequest(
-    `/requests/status.xml?command=in_enqueue&input=${encodeURIComponent(url)}`
+    `/requests/status.xml?command=in_enqueue&input=${encodeURIComponent(url)}${titleOption}`
   );
 }
 
@@ -213,16 +439,41 @@ async function resumePlayback() {
   console.log("▶ resumed");
 }
 
+async function setRepeatEnabled(enabled) {
+  const raw = await vlcRequest("/requests/status.json");
+  const status = JSON.parse(raw);
+  const current = status.repeat === true;
+  if (current !== enabled) {
+    await vlcRequest("/requests/status.xml?command=pl_repeat");
+  }
+}
+
+async function setVolume(value) {
+  // VLC HTTP API uses 256 as 100% volume.
+  const vlcValue = Math.round((value / 100) * 256);
+  await vlcRequest(
+    `/requests/status.xml?command=volume&val=${vlcValue}`
+  );
+  console.log(`🔊 volume ${value}%`);
+}
+
 // Smart play:
 //  - stopped/paused/unknown -> play now
 //  - playing               -> queue next
-async function playSmart(query) {
+async function playSmart(query, loop = false) {
   console.log(`Searching: ${query}`);
   const audioUrl = await ytDlpGetAudioUrl(query);
 
   const state = await getVlcState();
 
-  if (state === "stopped" || state === "paused" || state === "unknown") {
+  if (loop) {
+    await vlcRequest("/requests/status.xml?command=pl_stop");
+    await vlcRequest("/requests/status.xml?command=pl_empty");
+  } else {
+    await setRepeatEnabled(false);
+  }
+
+  if (!loop && (state === "stopped" || state === "paused" || state === "unknown")) {
     await vlcRequest(`/requests/status.xml?command=pl_empty`);
   }
 
@@ -231,8 +482,42 @@ async function playSmart(query) {
 
   // ★ タイトル上書き
   await vlcRequest(`/requests/status.xml?command=in_setinfo&name=title&value=${encodeURIComponent(query)}`);
+  await setRepeatEnabled(loop);
 
-  console.log("▶ done");
+  console.log(loop ? "🔁 repeat one" : "▶ done");
+}
+
+async function playCollection(target, shouldShuffle) {
+  console.log(`Loading collection: ${target}`);
+  const found = await ytDlpGetEntries(target);
+  const entries = shouldShuffle ? shuffle(found) : found;
+  if (!entries.length) throw new Error("No playable tracks found");
+
+  console.log(`Resolving ${entries.length} tracks...`);
+  const resolved = await mapWithConcurrency(entries, 3, async (entry, index) => {
+    console.log(`  ${index + 1}/${entries.length} ${entry.title}`);
+    try {
+      return { ...entry, audioUrl: await ytDlpGetAudioUrl(entry.url) };
+    } catch (e) {
+      console.error(`  skipped: ${entry.title} (${e.message})`);
+      return null;
+    }
+  });
+  const playable = resolved.filter(Boolean);
+  if (!playable.length) throw new Error("No tracks could be resolved");
+
+  await vlcRequest("/requests/status.xml?command=pl_stop");
+  await vlcRequest("/requests/status.xml?command=pl_empty");
+  for (const entry of playable) {
+    await enqueueUrl(entry.audioUrl, entry.title);
+  }
+  await vlcRequest("/requests/status.xml?command=pl_play");
+  await vlcRequest(
+    `/requests/status.xml?command=in_setinfo&name=title&value=${encodeURIComponent(playable[0].title)}`
+  );
+
+  console.log(`▶ loaded ${playable.length} tracks`);
+  return playable.length;
 }
 
 // --- CLI ---
@@ -240,6 +525,7 @@ async function playSmart(query) {
 function printHelp() {
   console.log("Commands:");
   console.log("  !play <keyword|url>  : stopped/paused -> play now, playing -> queue next");
+  console.log("  !playloop <keyword|url> : clear queue and repeat one track");
   console.log("  !stop                : stop playback");
   console.log("  !clear               : stop + clear playlist");
   console.log("  !skip                : next track");
@@ -249,6 +535,13 @@ function printHelp() {
   console.log("  !help                : show this help");
   console.log("  !quit                : exit");
   console.log("  !queue               : show current queue");
+  console.log("  !random <keyword>    : shuffle 15 YouTube search results");
+  console.log("  !playlist <url>      : play up to 50 playlist tracks");
+  console.log("  !now                 : show current track");
+  console.log("  !volume <0-100>      : set VLC volume");
+  console.log("  !pomo <work> <break> : start repeating Pomodoro");
+  console.log("  !pomo status         : show Pomodoro status");
+  console.log("  !pomo stop           : stop Pomodoro");
 }
 
 const rl = readline.createInterface({
@@ -293,6 +586,58 @@ rl.on("line", async (line) => {
     return;
   }
 
+  if (s === "!now") {
+    await run(async () => {
+      const now = await getNowPlaying();
+      console.log(now.title ? `Now playing: ${now.title}` : `Nothing playing (${now.state})`);
+    });
+    return;
+  }
+
+  if (s.startsWith("!volume ")) {
+    const value = Number(s.slice("!volume ".length).trim());
+    if (!Number.isInteger(value) || value < 0 || value > 100) {
+      console.log("usage: !volume <0-100>");
+      rl.prompt();
+      return;
+    }
+    await run(() => setVolume(value));
+    return;
+  }
+
+  if (s === "!pomo status") {
+    const status = getPomodoroStatus();
+    if (!status.active) console.log("Pomodoro is not running");
+    else console.log(`Pomodoro ${status.phase}: ${Math.ceil(status.remainingSeconds / 60)} min remaining`);
+    rl.prompt();
+    return;
+  }
+
+  if (s === "!pomo stop") {
+    stopPomodoro();
+    rl.prompt();
+    return;
+  }
+
+  if (s.startsWith("!pomo ")) {
+    const match = s.match(/^!pomo\s+(\d+)\s+(\d+)$/);
+    if (!match) {
+      console.log("usage: !pomo <work minutes> <break minutes>");
+      rl.prompt();
+      return;
+    }
+    const work = Number(match[1]);
+    const rest = Number(match[2]);
+    if (work < 1 || rest < 1 || work > 1440 || rest > 1440) {
+      console.log("minutes must be from 1 to 1440");
+      rl.prompt();
+      return;
+    }
+    startPomodoro(work, rest);
+    rl.prompt();
+    return;
+  }
+
   if (s === "!stop") {
     await run(stopPlayback);
     return;
@@ -329,6 +674,39 @@ rl.on("line", async (line) => {
     return;
   }
 
+  if (s.startsWith("!playloop ")) {
+    const q = s.slice("!playloop ".length).trim();
+    if (!q) {
+      console.log("usage: !playloop <keyword or url>");
+      rl.prompt();
+      return;
+    }
+    await run(() => playSmart(q, true));
+    return;
+  }
+
+  if (s.startsWith("!random ")) {
+    const q = s.slice("!random ".length).trim();
+    if (!q) {
+      console.log("usage: !random <keyword>");
+      rl.prompt();
+      return;
+    }
+    await run(() => playCollection(`ytsearch15:${q}`, true));
+    return;
+  }
+
+  if (s.startsWith("!playlist ")) {
+    const url = s.slice("!playlist ".length).trim();
+    if (!isUrl(url)) {
+      console.log("usage: !playlist <YouTube playlist URL>");
+      rl.prompt();
+      return;
+    }
+    await run(() => playCollection(url, false));
+    return;
+  }
+
   if (s === "!queue") {
   try {
     const q = await getQueue();
@@ -352,6 +730,7 @@ rl.on("line", async (line) => {
 });
 
 rl.on("close", () => {
+  stopPomodoro(false);
   console.log("bye");
   process.exit(0);
 });

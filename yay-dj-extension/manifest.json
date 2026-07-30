@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Yay DJ Bot",
-  "version": "1.0.1",
-  "description": "Watch Yay conference chat and play YouTube on !play",
+  "version": "1.3.0",
+  "description": "Control a local YouTube DJ bot from Yay conference chat",
   "permissions": ["tabs", "scripting", "storage"],
   "host_permissions": ["https://yay.space/*", "https://www.youtube.com/*", "http://127.0.0.1/*"],
   "background": {
