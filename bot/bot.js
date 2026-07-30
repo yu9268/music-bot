@@ -102,6 +102,30 @@ http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, ...now });
     }
 
+    if (u.pathname === "/pomo/start") {
+      const work = Number(u.searchParams.get("work"));
+      const rest = Number(u.searchParams.get("break"));
+      if (
+        !Number.isInteger(work) || !Number.isInteger(rest) ||
+        work < 1 || rest < 1 || work > 1440 || rest > 1440
+      ) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: "work and break must be integers from 1 to 1440",
+        });
+      }
+      return sendJson(res, 200, { ok: true, ...startPomodoro(work, rest) });
+    }
+
+    if (u.pathname === "/pomo/stop") {
+      stopPomodoro();
+      return sendJson(res, 200, { ok: true, active: false });
+    }
+
+    if (u.pathname === "/pomo/status") {
+      return sendJson(res, 200, { ok: true, ...getPomodoroStatus() });
+    }
+
     if (u.pathname === "/volume") {
       const value = Number(u.searchParams.get("value"));
       if (!Number.isInteger(value) || value < 0 || value > 100) {
@@ -124,11 +148,88 @@ http.createServer(async (req, res) => {
 });
 
 const readline = require("readline");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
+const path = require("path");
 
 const VLC_HOST = "127.0.0.1";
 const VLC_PORT = 8080;
 const VLC_PASSWORD = "vlcpass"; // ←自分のに変える（Lua HTTP password）
+
+const POMO_SOUNDS = {
+  work: path.join(__dirname, "sounds", "work-end.mp3"),
+  break: path.join(__dirname, "sounds", "break-end.mp3"),
+};
+
+let pomo = null;
+let alarmProcess = null;
+
+function playPomoAlarm(soundPath) {
+  if (alarmProcess && !alarmProcess.killed) alarmProcess.kill();
+  alarmProcess = spawn("ffplay", [
+    "-nodisp",
+    "-autoexit",
+    "-loglevel", "quiet",
+    soundPath,
+  ], { windowsHide: true, stdio: "ignore" });
+  alarmProcess.on("error", (error) => {
+    console.error(`Pomodoro alarm error: ${error.message}`);
+  });
+  alarmProcess.on("exit", () => {
+    alarmProcess = null;
+  });
+}
+
+function schedulePomoPhase() {
+  if (!pomo) return;
+  const delay = Math.max(0, pomo.deadline - Date.now());
+  pomo.timer = setTimeout(() => {
+    if (!pomo) return;
+    const finishedPhase = pomo.phase;
+    playPomoAlarm(finishedPhase === "work" ? POMO_SOUNDS.work : POMO_SOUNDS.break);
+    pomo.phase = finishedPhase === "work" ? "break" : "work";
+    const minutes = pomo.phase === "work" ? pomo.workMinutes : pomo.breakMinutes;
+    pomo.deadline = Date.now() + minutes * 60 * 1000;
+    console.log(
+      pomo.phase === "work"
+        ? `🍅 Work started (${minutes} min)`
+        : `☕ Break started (${minutes} min)`
+    );
+    schedulePomoPhase();
+  }, delay);
+}
+
+function startPomodoro(workMinutes, breakMinutes) {
+  stopPomodoro(false);
+  pomo = {
+    workMinutes,
+    breakMinutes,
+    phase: "work",
+    deadline: Date.now() + workMinutes * 60 * 1000,
+    timer: null,
+  };
+  schedulePomoPhase();
+  console.log(`🍅 Pomodoro started: ${workMinutes} min work / ${breakMinutes} min break`);
+  return getPomodoroStatus();
+}
+
+function stopPomodoro(log = true) {
+  if (pomo?.timer) clearTimeout(pomo.timer);
+  pomo = null;
+  if (alarmProcess && !alarmProcess.killed) alarmProcess.kill();
+  alarmProcess = null;
+  if (log) console.log("⏹ Pomodoro stopped");
+}
+
+function getPomodoroStatus() {
+  if (!pomo) return { active: false };
+  return {
+    active: true,
+    phase: pomo.phase,
+    remainingSeconds: Math.max(0, Math.ceil((pomo.deadline - Date.now()) / 1000)),
+    workMinutes: pomo.workMinutes,
+    breakMinutes: pomo.breakMinutes,
+  };
+}
 
 function basicAuthHeader(password) {
   const token = Buffer.from(`:${password}`, "utf8").toString("base64"); // username空欄
@@ -438,6 +539,9 @@ function printHelp() {
   console.log("  !playlist <url>      : play up to 50 playlist tracks");
   console.log("  !now                 : show current track");
   console.log("  !volume <0-100>      : set VLC volume");
+  console.log("  !pomo <work> <break> : start repeating Pomodoro");
+  console.log("  !pomo status         : show Pomodoro status");
+  console.log("  !pomo stop           : stop Pomodoro");
 }
 
 const rl = readline.createInterface({
@@ -498,6 +602,39 @@ rl.on("line", async (line) => {
       return;
     }
     await run(() => setVolume(value));
+    return;
+  }
+
+  if (s === "!pomo status") {
+    const status = getPomodoroStatus();
+    if (!status.active) console.log("Pomodoro is not running");
+    else console.log(`Pomodoro ${status.phase}: ${Math.ceil(status.remainingSeconds / 60)} min remaining`);
+    rl.prompt();
+    return;
+  }
+
+  if (s === "!pomo stop") {
+    stopPomodoro();
+    rl.prompt();
+    return;
+  }
+
+  if (s.startsWith("!pomo ")) {
+    const match = s.match(/^!pomo\s+(\d+)\s+(\d+)$/);
+    if (!match) {
+      console.log("usage: !pomo <work minutes> <break minutes>");
+      rl.prompt();
+      return;
+    }
+    const work = Number(match[1]);
+    const rest = Number(match[2]);
+    if (work < 1 || rest < 1 || work > 1440 || rest > 1440) {
+      console.log("minutes must be from 1 to 1440");
+      rl.prompt();
+      return;
+    }
+    startPomodoro(work, rest);
+    rl.prompt();
     return;
   }
 
@@ -593,6 +730,7 @@ rl.on("line", async (line) => {
 });
 
 rl.on("close", () => {
+  stopPomodoro(false);
   console.log("bye");
   process.exit(0);
 });
