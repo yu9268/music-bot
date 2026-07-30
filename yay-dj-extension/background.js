@@ -17,6 +17,18 @@ function parseCommand(text) {
   m = t.match(/^!playlist,(https?:\/\/\S+)$/i);
   if (m) return { cmd: "playlist", url: m[1].trim() };
 
+  m = t.match(/^!pomo,(\d{1,4}),(\d{1,4})$/i);
+  if (m) {
+    const work = Number(m[1]);
+    const rest = Number(m[2]);
+    if (work >= 1 && rest >= 1 && work <= 1440 && rest <= 1440) {
+      return { cmd: "pomoStart", work, break: rest };
+    }
+  }
+
+  if (/^!pomo,stop$/i.test(t)) return { cmd: "pomoStop" };
+  if (/^!pomo,status$/i.test(t)) return { cmd: "pomoStatus" };
+
   m = t.match(/^!vol,(\d{1,3})$/i);
   if (m) {
     const value = Number(m[1]);
