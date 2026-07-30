@@ -55,6 +55,13 @@ async function callBot(cmd) {
     return fetch(`${BOT}/playlist?url=${encodeURIComponent(cmd.url)}`);
   }
   if (cmd.cmd === "now") return fetch(`${BOT}/now`);
+  if (cmd.cmd === "pomoStart") {
+    return fetch(
+      `${BOT}/pomo/start?work=${encodeURIComponent(cmd.work)}&break=${encodeURIComponent(cmd.break)}`
+    );
+  }
+  if (cmd.cmd === "pomoStop") return fetch(`${BOT}/pomo/stop`);
+  if (cmd.cmd === "pomoStatus") return fetch(`${BOT}/pomo/status`);
   if (cmd.cmd === "volume") {
     return fetch(`${BOT}/volume?value=${encodeURIComponent(cmd.value)}`);
   }
@@ -83,6 +90,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       reply = data?.title
         ? `♪ 再生中：${data.title}`
         : "現在再生中の曲はありません";
+    } else if (cmd.cmd === "pomoStart" && res.ok) {
+      reply = `🍅 ポモドーロ開始：作業${cmd.work}分／休憩${cmd.break}分`;
+    } else if (cmd.cmd === "pomoStop" && res.ok) {
+      reply = "⏹ ポモドーロを停止しました";
+    } else if (cmd.cmd === "pomoStatus" && res.ok) {
+      if (!data?.active) {
+        reply = "ポモドーロは動いていません";
+      } else {
+        const label = data.phase === "work" ? "作業" : "休憩";
+        const total = Number(data.remainingSeconds || 0);
+        const minutes = Math.floor(total / 60);
+        const seconds = total % 60;
+        reply = `🍅 ${label}中：残り${minutes}分${String(seconds).padStart(2, "0")}秒`;
+      }
     }
 
     return sendResponse({
