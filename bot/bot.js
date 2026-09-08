@@ -14,11 +14,28 @@
 //  - Node.js 18+ (fetch available)
 //  - yt-dlp installed and callable as `yt-dlp`
 //  - VLC started with HTTP interface enabled (Lua HTTP password set)
+//
+// Playback strategy:
+//  - yt-dlp downloads the selected YouTube audio to ./temp_audio
+//  - VLC plays the local file instead of a temporary videoplayback URL
+//  - this avoids signed URL / header / expiry issues in VLC
 
-// --- HTTP server for Chrome extension ---
 const http = require("http");
+const readline = require("readline");
+const { execFile } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const { pathToFileURL } = require("url");
+
 const BOT_PORT = 39200;
 const BOT_HOST = "127.0.0.1";
+
+const VLC_HOST = "127.0.0.1";
+const VLC_PORT = 8080;
+const VLC_PASSWORD = "vlcpass"; // VLCのLua HTTP passwordと合わせる
+
+const TEMP_DIR = path.join(__dirname, "temp_audio");
+fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -28,215 +45,250 @@ function sendJson(res, code, obj) {
   res.end(body);
 }
 
-http.createServer(async (req, res) => {
-  try {
-    const u = new URL(req.url, `http://${BOT_HOST}:${BOT_PORT}`);
-
-    if (u.pathname === "/play") {
-      const q = (u.searchParams.get("q") || "").trim();
-      if (!q) return sendJson(res, 400, { ok: false });
-      await playSmart(q);
-      return sendJson(res, 200, { ok: true });
-    }
-
-    if (u.pathname === "/stop") {
-      await stopPlayback();
-      return sendJson(res, 200, { ok: true });
-    }
-
-    // 例: httpサーバ内のルーティングに追加
-    if (u.pathname === "/skip") {
-        await skipNext();
-        return sendJson(res, 200, { ok: true, action: "skip" });
-    }
-
-    if (u.pathname === "/clear") {
-        await clearQueue();
-        return sendJson(res, 200, { ok: true, action: "clear" });
-    }
-
-    if (u.pathname === "/pause") {
-        await pausePlayback();
-        return sendJson(res, 200, { ok: true, action: "pause" });
-    }
-
-    if (u.pathname === "/resume") {
-        await resumePlayback();
-        return sendJson(res, 200, { ok: true, action: "resume" });
-    }
-
-    if (u.pathname === "/state") {
-        const state = await getVlcState();
-        return sendJson(res, 200, { ok: true, state });
-    }
-
-    if (u.pathname === "/queue") {
-        const queue = await getQueue();
-        return sendJson(res, 200, { ok: true, queue });
-    }
-
-    return sendJson(res, 404, { ok: false });
-
-  } catch (e) {
-    return sendJson(res, 500, { ok: false, error: String(e.message) });
-  }
-}).listen(BOT_PORT, BOT_HOST, () => {
-  console.log("Bot HTTP running on 127.0.0.1:39200");
-});
-
-const readline = require("readline");
-const { execFile } = require("child_process");
-
-const VLC_HOST = "127.0.0.1";
-const VLC_PORT = 8080;
-const VLC_PASSWORD = "vlcpass"; // ←自分のに変える（Lua HTTP password）
-
 function basicAuthHeader(password) {
-  const token = Buffer.from(`:${password}`, "utf8").toString("base64"); // username空欄
+  const token = Buffer.from(`:${password}`, "utf8").toString("base64");
   return `Basic ${token}`;
 }
 
 async function vlcRequest(pathAndQuery) {
   const url = `http://${VLC_HOST}:${VLC_PORT}${pathAndQuery}`;
-  const res = await fetch(url, {
-    headers: { Authorization: basicAuthHeader(VLC_PASSWORD) },
-  });
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: basicAuthHeader(VLC_PASSWORD) },
+    });
+  } catch (e) {
+    throw new Error(`VLC HTTP connection failed (${url}): ${e.message}`);
+  }
+
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`VLC HTTP ${res.status}: ${text.slice(0, 300)}`);
   }
+
   return res.text();
-}
-
-async function getQueue() {
-  const res = await vlcRequest("/requests/playlist.json");
-  const data = JSON.parse(res);
-
-  const list = [];
-
-  function walk(node) {
-    if (!node) return;
-    if (node.children) {
-      node.children.forEach(walk);
-    } else if (node.name) {
-      list.push({
-        name: node.name,
-        current: node.current === "current"
-      });
-    }
-  }
-
-  walk(data);
-
-  return list;
 }
 
 function isUrl(s) {
   return /^https?:\/\//i.test(String(s).trim());
 }
 
-function ytDlpGetAudioUrl(queryOrUrl) {
+function downloadAudio(queryOrUrl) {
   return new Promise((resolve, reject) => {
     const target = isUrl(queryOrUrl) ? queryOrUrl : `ytsearch1:${queryOrUrl}`;
+    const outputTemplate = path.join(
+      TEMP_DIR,
+      "%(title).80s [%(id)s].%(ext)s"
+    );
 
-    // -f ba  : best audio
-    // -g     : print direct media URL only
-    const args = ["-f", "ba", "-g", target];
+    // VLC側ではYouTubeの一時videoplayback URLを開かない。
+    // yt-dlpで音声をローカル保存し、最終ファイルパスだけ受け取る。
+    const args = [
+      "--no-playlist",
+      "--no-warnings",
+      "-f",
+      "bestaudio/best",
+      "-o",
+      outputTemplate,
+      "--print",
+      "after_move:filepath",
+      target,
+    ];
 
-    execFile("yt-dlp", args, { windowsHide: true }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(`yt-dlp failed: ${stderr || err.message}`));
-        return;
+    execFile(
+      "yt-dlp",
+      args,
+      { windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          reject(new Error(`yt-dlp failed: ${stderr || err.message}`));
+          return;
+        }
+
+        const lines = stdout
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+        const filePath = lines.at(-1);
+        if (!filePath) {
+          reject(new Error("yt-dlp did not return a downloaded file path"));
+          return;
+        }
+
+        const absolutePath = path.resolve(filePath);
+        if (!fs.existsSync(absolutePath)) {
+          reject(new Error(`downloaded file not found: ${absolutePath}`));
+          return;
+        }
+
+        resolve(absolutePath);
       }
-      const line = stdout
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .find(Boolean);
-
-      if (!line) {
-        reject(new Error("yt-dlp output is empty"));
-        return;
-      }
-      resolve(line);
-    });
+    );
   });
 }
 
+async function getQueue() {
+  const res = await vlcRequest("/requests/playlist.json");
+  const data = JSON.parse(res);
+  const list = [];
+
+  function walk(node) {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (node.children) {
+      node.children.forEach(walk);
+      return;
+    }
+    if (node.name) {
+      list.push({
+        name: node.name,
+        current: node.current === "current",
+      });
+    }
+  }
+
+  walk(data);
+  return list;
+}
+
 async function getVlcState() {
-  const xml = await vlcRequest(`/requests/status.xml`);
+  const xml = await vlcRequest("/requests/status.xml");
   const m = xml.match(/<state>([^<]+)<\/state>/);
   return m ? m[1].trim() : "unknown";
 }
 
-// --- VLC controls ---
+async function enqueueInput(input, title = "") {
+  const titleOption = title
+    ? `&option=${encodeURIComponent(`:meta-title=${title}`)}`
+    : "";
 
-async function enqueueUrl(url) {
   await vlcRequest(
-    `/requests/status.xml?command=in_enqueue&input=${encodeURIComponent(url)}`
+    `/requests/status.xml?command=in_enqueue&input=${encodeURIComponent(input)}${titleOption}`
   );
 }
 
-async function playNow(url) {
-  // stopped/paused時に「前の曲が続きから再開」みたいな挙動を潰すために
-  // 一旦 stop + empty してから入れ直す
-  await vlcRequest(`/requests/status.xml?command=pl_stop`);
-  await vlcRequest(`/requests/status.xml?command=pl_empty`);
-  await enqueueUrl(url);
-  await vlcRequest(`/requests/status.xml?command=pl_play`);
+async function playNow(input, title = "") {
+  await vlcRequest("/requests/status.xml?command=pl_stop");
+  await vlcRequest("/requests/status.xml?command=pl_empty");
+  await enqueueInput(input, title);
+  await vlcRequest("/requests/status.xml?command=pl_play");
 }
 
 async function stopPlayback() {
-  await vlcRequest(`/requests/status.xml?command=pl_stop`);
+  await vlcRequest("/requests/status.xml?command=pl_stop");
   console.log("⏹ stopped");
 }
 
 async function clearQueue() {
-  await vlcRequest(`/requests/status.xml?command=pl_stop`);
-  await vlcRequest(`/requests/status.xml?command=pl_empty`);
+  await vlcRequest("/requests/status.xml?command=pl_stop");
+  await vlcRequest("/requests/status.xml?command=pl_empty");
   console.log("🧹 cleared (stopped + emptied)");
 }
 
 async function skipNext() {
-  await vlcRequest(`/requests/status.xml?command=pl_next`);
+  await vlcRequest("/requests/status.xml?command=pl_next");
   console.log("⏭ skipped");
 }
 
 async function pausePlayback() {
-  // pl_pause はトグル
-  await vlcRequest(`/requests/status.xml?command=pl_pause`);
+  await vlcRequest("/requests/status.xml?command=pl_pause");
   console.log("⏸ toggled pause");
 }
 
 async function resumePlayback() {
-  // 再開は pl_play が無難
-  await vlcRequest(`/requests/status.xml?command=pl_play`);
+  await vlcRequest("/requests/status.xml?command=pl_play");
   console.log("▶ resumed");
 }
 
-// Smart play:
-//  - stopped/paused/unknown -> play now
-//  - playing               -> queue next
+// stopped/paused/unknown -> play now
+// playing                -> download and queue next
 async function playSmart(query) {
-  console.log(`Searching: ${query}`);
-  const audioUrl = await ytDlpGetAudioUrl(query);
+  console.log(`Downloading: ${query}`);
+  const localFile = await downloadAudio(query);
+  const input = pathToFileURL(localFile).href;
+
+  console.log(`Local file: ${localFile}`);
 
   const state = await getVlcState();
 
-  if (state === "stopped" || state === "paused" || state === "unknown") {
-    await vlcRequest(`/requests/status.xml?command=pl_empty`);
+  if (state === "playing") {
+    await enqueueInput(input, query);
+    console.log(`➕ queued: ${query}`);
+    return;
   }
 
-  await vlcRequest(`/requests/status.xml?command=in_enqueue&input=${encodeURIComponent(audioUrl)}`);
-  await vlcRequest(`/requests/status.xml?command=pl_play`);
-
-  // ★ タイトル上書き
-  await vlcRequest(`/requests/status.xml?command=in_setinfo&name=title&value=${encodeURIComponent(query)}`);
-
-  console.log("▶ done");
+  await playNow(input, query);
+  console.log(`▶ now playing: ${query}`);
 }
 
-// --- CLI ---
+// --- HTTP server for Chrome extension ---
+http
+  .createServer(async (req, res) => {
+    try {
+      const u = new URL(req.url, `http://${BOT_HOST}:${BOT_PORT}`);
 
+      if (u.pathname === "/play") {
+        const q = (u.searchParams.get("q") || "").trim();
+        if (!q) {
+          return sendJson(res, 400, { ok: false, error: "query is required" });
+        }
+        await playSmart(q);
+        return sendJson(res, 200, { ok: true, action: "play", query: q });
+      }
+
+      if (u.pathname === "/stop") {
+        await stopPlayback();
+        return sendJson(res, 200, { ok: true, action: "stop" });
+      }
+
+      if (u.pathname === "/skip") {
+        await skipNext();
+        return sendJson(res, 200, { ok: true, action: "skip" });
+      }
+
+      if (u.pathname === "/clear") {
+        await clearQueue();
+        return sendJson(res, 200, { ok: true, action: "clear" });
+      }
+
+      if (u.pathname === "/pause") {
+        await pausePlayback();
+        return sendJson(res, 200, { ok: true, action: "pause" });
+      }
+
+      if (u.pathname === "/resume") {
+        await resumePlayback();
+        return sendJson(res, 200, { ok: true, action: "resume" });
+      }
+
+      if (u.pathname === "/state") {
+        const state = await getVlcState();
+        return sendJson(res, 200, { ok: true, state });
+      }
+
+      if (u.pathname === "/queue") {
+        const queue = await getQueue();
+        return sendJson(res, 200, { ok: true, queue });
+      }
+
+      return sendJson(res, 404, { ok: false, error: "not found" });
+    } catch (e) {
+      return sendJson(res, 500, {
+        ok: false,
+        error: String(e.message || e),
+      });
+    }
+  })
+  .listen(BOT_PORT, BOT_HOST, () => {
+    console.log(`Bot HTTP running on http://${BOT_HOST}:${BOT_PORT}`);
+  });
+
+// --- CLI ---
 function printHelp() {
   console.log("Commands:");
   console.log("  !play <keyword|url>  : stopped/paused -> play now, playing -> queue next");
@@ -246,9 +298,9 @@ function printHelp() {
   console.log("  !pause               : toggle pause");
   console.log("  !resume              : resume/play");
   console.log("  !state               : show VLC state");
+  console.log("  !queue               : show current queue");
   console.log("  !help                : show this help");
   console.log("  !quit                : exit");
-  console.log("  !queue               : show current queue");
 }
 
 const rl = readline.createInterface({
@@ -330,22 +382,21 @@ rl.on("line", async (line) => {
   }
 
   if (s === "!queue") {
-  try {
-    const q = await getQueue();
-    if (!q.length) {
-      console.log("Queue empty");
-    } else {
+    await run(async () => {
+      const q = await getQueue();
+      if (!q.length) {
+        console.log("Queue empty");
+        return;
+      }
+
       console.log("=== VLC Queue ===");
       q.forEach((item, i) => {
         const mark = item.current ? "▶" : " ";
         console.log(`${mark} ${i + 1}. ${item.name}`);
       });
-    }
-  } catch (e) {
-    console.error("Queue error:", e.message);
+    });
+    return;
   }
-  return rl.prompt();
-}
 
   console.log("unknown command. type !help");
   rl.prompt();
